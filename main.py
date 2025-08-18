@@ -17,9 +17,9 @@ q_min = [0, 0, 0, 0]
 q_max = [5, 5, 4, 3]
 
 # Eigenproduktion (über alle T Perioden, z. B. kWh)
-own_prod_total   = [ 6,  0, 5,  0]
+own_prod_total   = [ 0,  12, 0,  5]
 # Eigenbedarf (über alle T Perioden, z. B. kWh)
-own_demand_total = [10, 25,  8, 15]
+own_demand_total = [8, 25,  13, 15]
 
 # daraus bauen wir gleichmäßig verteilte Perioden-Profile:
 demand = [[own_demand_total[i]/T for t in range(T)] for i in range(P)]
@@ -32,7 +32,6 @@ K_export = [10, 10, 8, 10, 10]  # Export-Kappe je Periode (Beispiel)
 # Individuelle Optimierung (Pi)
 def solve_individual(i):
     m = pulp.LpProblem(f"Indiv_{i}", pulp.LpMinimize)
-    qDA = pulp.LpVariable.dicts("qDA", range(T), lowBound=0)
     qB  = pulp.LpVariable.dicts("qB",  range(T), lowBound=0)
     use_pv = pulp.LpVariable.dicts("use_pv", range(T), lowBound=0)
     export   = pulp.LpVariable.dicts("export",   range(T), lowBound=0)
@@ -40,7 +39,7 @@ def solve_individual(i):
 
     # Zielfunktion: nur Einkaufskosten (PV hat hier keine direkten Kosten)
     m += pulp.lpSum(
-        p_DA[t]*qDA[t] + p_B[t]*qB[t]
+        p_B[t]*qB[t]
         - p_feed[t]*export[t]
         - r_curt[t]*curtail[t]
         for t in range(T)
@@ -49,12 +48,12 @@ def solve_individual(i):
 
     # Per-Perioden-Bilanz: (Einkauf + PV-Nutzung) deckt Nachfrage
     for t in range(T):
-        m += qDA[t] + qB[t] + use_pv[t] == demand[i][t]
+        m += qB[t] + use_pv[t] == demand[i][t]
         m += use_pv[t] + export[t] + curtail[t] <= pv[i][t]  # PV-Nutzung limitiert durch vorhandene PV
 
         # Per-Perioden-Grenzen
-        m += qDA[t] + qB[t] >= q_min[i]
-        m += qDA[t] + qB[t] <= q_max[i]
+        m += qB[t] >= q_min[i]
+        m += qB[t] <= q_max[i]
 
         
 
@@ -62,13 +61,12 @@ def solve_individual(i):
     status = m.solve(pulp.PULP_CBC_CMD(msg=0))
     v_total = pulp.value(m.objective)
     v_stage = [pulp.value(
-        p_DA[t]*qDA[t] + p_B[t]*qB[t]
+        p_B[t]*qB[t]
         - p_feed[t]*export[t]
         - r_curt[t]*curtail[t]
         ) for t in range(T)
     ]
     allocations = {
-        "qDA": [pulp.value(qDA[t]) for t in range(T)],
         "qB": [pulp.value(qB[t]) for t in range(T)],
         "use_pv": [pulp.value(use_pv[t]) for t in range(T)],
         "export": [pulp.value(export[t]) for t in range(T)],
@@ -121,7 +119,7 @@ def solve_aggregation(mode="utilitarian", accept_type=None):
             m += costs[i] / denom <= z
         m += z
 
-    # Acceptability (wie gehabt)
+    # Acceptability
     if accept_type == "Aav":
         for i in range(P):
             m += pulp.lpSum(costs_stage[(i,t)] for t in range(T)) <= sum(v_stagewise[i])
