@@ -13,43 +13,45 @@ p_DA = [2, 16, 1, 10, 1]   # Day-Ahead Preise
 p_B  = [6, 25, 5, 15, 5]   # Balancing Preise
 
 q_DA_min_trade = 11
-q_min = [0, 0, 0, 0]
+q_min = [0, 5, 0, 2]
 q_max = [5, 5, 4, 3]
 
-# Eigenproduktion (über alle T Perioden, z. B. kWh)
-own_prod_total   = [ 0,  12, 0,  5]
-# Eigenbedarf (über alle T Perioden, z. B. kWh)
-own_demand_total = [8, 25,  13, 15]
+alpha = 0.98
 
-# daraus bauen wir gleichmäßig verteilte Perioden-Profile:
-demand = [[own_demand_total[i]/T for t in range(T)] for i in range(P)]
-pv     = [[own_prod_total[i]/T   for t in range(T)] for i in range(P)]
+# Eigenproduktion (über alle T Perioden, z. B. MWh)
+own_prod_total   = [ 0,  0, 0,  0]
+# Eigenbedarf (über alle T Perioden, z. B. MWh)
+own_demand_total = [10, 25,  8, 15]
 
-p_feed = [0.08]*T          # Einspeisetarif [€/kWh], Beispiel
-r_curt = [0.09]*T          # Vergütung für Verzicht (feed-in + kleiner Bonus)
+demand = [([own_demand_total[i]/T]*T) for i in range(P)]
+pv     = [([own_prod_total[i]/T]*T) for i in range(P)]
+
+p_feed = [0]*T          # Einspeisetarif [€/MWh], Beispiel
+r_curt = [0]*T                      # Vergütung für Verzicht (feed-in + kleiner Bonus)
 K_export = [10, 10, 8, 10, 10]  # Export-Kappe je Periode (Beispiel)
 
 # Individuelle Optimierung (Pi)
 def solve_individual(i):
     m = pulp.LpProblem(f"Indiv_{i}", pulp.LpMinimize)
+    qDA = pulp.LpVariable.dicts("qDA", (range(P), range(T)), lowBound=0)
     qB  = pulp.LpVariable.dicts("qB",  range(T), lowBound=0)
     use_pv = pulp.LpVariable.dicts("use_pv", range(T), lowBound=0)
     export   = pulp.LpVariable.dicts("export",   range(T), lowBound=0)
-    curtail  = pulp.LpVariable.dicts("curtail",  range(T), lowBound=0)
+    curtail  = pulp.LpVariable.dicts("curtail",  (range(T)), lowBound=0)
 
     # Zielfunktion: nur Einkaufskosten (PV hat hier keine direkten Kosten)
     m += pulp.lpSum(
-        p_B[t]*qB[t]
+        p_DA[t]*qDA[i][t] + p_B[t]*qB[t]
         - p_feed[t]*export[t]
         - r_curt[t]*curtail[t]
         for t in range(T)
         )   
     
+    m += pulp.lpSum((qB[t] + use_pv[t]) for t in range (T)) == own_demand_total[i]
 
-    # Per-Perioden-Bilanz: (Einkauf + PV-Nutzung) deckt Nachfrage
     for t in range(T):
-        m += qB[t] + use_pv[t] == demand[i][t]
-        m += use_pv[t] + export[t] + curtail[t] <= pv[i][t]  # PV-Nutzung limitiert durch vorhandene PV
+        
+        m += use_pv[t] + export[t] <= pv[i][t]  # PV-Nutzung limitiert durch vorhandene PV
 
         # Per-Perioden-Grenzen
         m += qB[t] >= q_min[i]
@@ -63,14 +65,12 @@ def solve_individual(i):
     v_stage = [pulp.value(
         p_B[t]*qB[t]
         - p_feed[t]*export[t]
-        - r_curt[t]*curtail[t]
         ) for t in range(T)
     ]
     allocations = {
         "qB": [pulp.value(qB[t]) for t in range(T)],
         "use_pv": [pulp.value(use_pv[t]) for t in range(T)],
         "export": [pulp.value(export[t]) for t in range(T)],
-        "curtail": [pulp.value(curtail[t]) for t in range(T)],
     }
     return v_total, v_stage, allocations
 
@@ -120,22 +120,26 @@ def solve_aggregation(mode="utilitarian", accept_type=None):
         m += z
 
     # Acceptability
-    if accept_type == "Aav":
+    if accept_type == "As":
+        print("in As")
         for i in range(P):
-            m += pulp.lpSum(costs_stage[(i,t)] for t in range(T)) <= sum(v_stagewise[i])
+            for t in range(T):
+                m += costs_stage[(i,t)] <= alpha * v_stagewise[i][t]
     elif accept_type == "Ap":
+        print("in Ap")
         for i in range(P):
             for t in range(T):
-                m += pulp.lpSum(costs_stage[(i,tau)] for tau in range(t+1)) <= sum(v_stagewise[i][:t+1])
-    elif accept_type == "As":
+                m += pulp.lpSum(costs_stage[(i,tau)] for tau in range(t+1)) <= alpha * pulp.lpSum(v_stagewise[i][:t+1])
+    elif accept_type == "Aav":
+        print("in Aav")
         for i in range(P):
-            for t in range(T):
-                m += costs_stage[(i,t)] <= v_stagewise[i][t]
-
+            m += pulp.lpSum(costs_stage[(i,t)] for t in range(T)) <= alpha * pulp.lpSum(v_stagewise[i])
+    
     # Per-Perioden-Bilanzen inkl. PV
     for i in range(P):
+        m += pulp.lpSum((qDA[i][t] + qB[i][t] + use_pv[i][t]) for t in range(T)) == own_demand_total[i]
         for t in range(T):
-            m += qDA[i][t] + qB[i][t] + use_pv[i][t] == demand[i][t]
+            
             m += use_pv[i][t] + export[i][t] + curtail[i][t] <= pv[i][t]
             
             m += qDA[i][t] + qB[i][t] >= q_min[i]
@@ -147,9 +151,11 @@ def solve_aggregation(mode="utilitarian", accept_type=None):
         m += qDA_total[t] >= q_DA_min_trade * bDA[t]
         for i in range(P):
             m += qDA[i][t] <= q_max[i] * bDA[t]  # wenn Markt "zu", dann 0
+    
+    #print(m.constraints)
+    
 
     status = m.solve(pulp.PULP_CBC_CMD(msg=0))
-
     total_cost = pulp.value(m.objective)
     indiv_costs = [pulp.value(costs[i]) for i in range(P)]
     savings_pct = [((v_individual[i] - indiv_costs[i]) / v_individual[i] * 100) if v_individual[i] > 0 else 0 for i in range(P)]
@@ -160,6 +166,8 @@ def solve_aggregation(mode="utilitarian", accept_type=None):
         "use_pv": [pulp.value(use_pv[i][t]) for t in range(T)],
         "export": [pulp.value(export[i][t]) for t in range(T)],
         "curtail": [pulp.value(curtail[i][t]) for t in range(T)],
+        "qDA_total": [pulp.value(qDA_total[t]) for t in range(T)],
+        "bDA": [pulp.value(bDA[t]) for t in range(T)],
     }
     for i in range(P)
     }
@@ -195,14 +203,14 @@ for mode, acc, label in cases:
 # 2) Gestapelte Balken zeichnen
 N = len(scenarios)
 x = np.arange(N)
-width = 0.75
+width = 0.2
 
 # Daten in Arrays
 costs = np.array(costs_by_agent)  # shape (N, 4)
 colors = ["#4e79a7", "#f28e2c", "#e15759", "#76b7b2"]  # P1..P4
 agent_labels = ["P1", "P2", "P3", "P4"]
 
-fig, ax = plt.subplots(figsize=(14, 6))
+fig, ax = plt.subplots(figsize=(10, 6))
 
 bottom = np.zeros(N)
 for j in range(4):  # je Prosumer
@@ -222,7 +230,6 @@ ax.legend(ncol=4, loc="upper left", bbox_to_anchor=(0,1.15))
 
 plt.tight_layout()
 plt.savefig("fairness_results_stacked.png", dpi=300)
-print("Gestapelter Plot gespeichert als fairness_results_stacked.png")
 
 SOLVER = pulp.PULP_CBC_CMD(msg=0, timeLimit=30)
 
