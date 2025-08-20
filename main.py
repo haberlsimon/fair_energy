@@ -9,7 +9,7 @@ P = 4
 #Anzahl Zeitschritte
 T = 5
 
-p_DA = [2, 16, 1, 10, 1]   # Day-Ahead Preise
+p_DA = [2, 16, 1, 10, 1]   # Day-Ahead Preise wie in fairness by design von Zoe Fornier
 p_B  = [6, 25, 5, 15, 5]   # Balancing Preise
 
 q_DA_min_trade = 11
@@ -19,15 +19,14 @@ q_max = [5, 5, 4, 3]
 alpha = 0.98
 
 # Eigenproduktion (über alle T Perioden, z. B. MWh)
-own_prod_total   = [ 0,  0, 0,  0]
+own_prod_total   = [ 1,  0, 0,  2]
 # Eigenbedarf (über alle T Perioden, z. B. MWh)
 own_demand_total = [10, 25,  8, 15]
 
-demand = [([own_demand_total[i]/T]*T) for i in range(P)]
 pv     = [([own_prod_total[i]/T]*T) for i in range(P)]
 
-p_feed = [0]*T          # Einspeisetarif [€/MWh], Beispiel
-r_curt = [0]*T                      # Vergütung für Verzicht (feed-in + kleiner Bonus)
+p_feed = [1, 12, 0, 8, 0]          # Einspeisetarif [€/MWh]
+r_curt = [1.1, 13, 0.1, 0.1]*T                      # Vergütung für Verzicht (feed-in + kleiner Bonus)
 K_export = [10, 10, 8, 10, 10]  # Export-Kappe je Periode (Beispiel)
 
 # Individuelle Optimierung (Pi)
@@ -121,17 +120,14 @@ def solve_aggregation(mode="utilitarian", accept_type=None):
 
     # Acceptability
     if accept_type == "As":
-        print("in As")
         for i in range(P):
             for t in range(T):
                 m += costs_stage[(i,t)] <= alpha * v_stagewise[i][t]
     elif accept_type == "Ap":
-        print("in Ap")
         for i in range(P):
             for t in range(T):
                 m += pulp.lpSum(costs_stage[(i,tau)] for tau in range(t+1)) <= alpha * pulp.lpSum(v_stagewise[i][:t+1])
     elif accept_type == "Aav":
-        print("in Aav")
         for i in range(P):
             m += pulp.lpSum(costs_stage[(i,t)] for t in range(T)) <= alpha * pulp.lpSum(v_stagewise[i])
     
@@ -166,8 +162,6 @@ def solve_aggregation(mode="utilitarian", accept_type=None):
         "use_pv": [pulp.value(use_pv[i][t]) for t in range(T)],
         "export": [pulp.value(export[i][t]) for t in range(T)],
         "curtail": [pulp.value(curtail[i][t]) for t in range(T)],
-        "qDA_total": [pulp.value(qDA_total[t]) for t in range(T)],
-        "bDA": [pulp.value(bDA[t]) for t in range(T)],
     }
     for i in range(P)
     }
@@ -260,9 +254,12 @@ def coalition_cost(S):
     m += pulp.lpSum(costs_S[i] for i in S)
 
     for i in S:
+        
+        m += pulp.lpSum((qDA[i][t] + qB[i][t] + use_pv[i][t]) for t in range(T)) == own_demand_total[i]
+
         for t in range(T):
             
-            m += qDA[i][t] + qB[i][t] + use_pv[i][t] == demand[i][t]
+            
             m += use_pv[i][t] + export[i][t] + curtail[i][t] <= pv[i][t]
 
             m += qDA[i][t] + qB[i][t] >= q_min[i]
