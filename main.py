@@ -2,13 +2,21 @@ import pulp
 import matplotlib.pyplot as plt
 import numpy as np
 from itertools import combinations
+import math
 
 #Anzahl Prosumer
 P = 4
 #Anzahl Zeitschritte
 T = 5
-#Export and Curtail, 0 bedeutet deaktiviert
-EC = 1
+
+# Zahlungslogiken
+EC                 = 0   # Export and Curtail ist möglich, 0 bedeutet deaktiviert
+FEED_IN_PAYMENTS   = 0   # 1 = Export wird vergütet (Erlös), 0 = kein Erlös
+CURTAIL_PAYMENTS   = 0   # 1 = Curtail wird vergütet, 0 = keine Vergütung
+INTERNAL_SHARING   = 0   # 1 = interne PV-Verteilung (send/recv) aktiv; 0 = aus
+
+# Interner Transferpreis π_t (€/MWh) – nur Verrechnung innerhalb des Systems
+PI = [2, 16, 1, 10, 1]
 
 p_DA = [2, 16, 1, 10, 1]   # Day-Ahead Preise wie in fairness by design von Zoe Fornier
 p_B  = [6, 25, 5, 15, 5]   # Balancing Preise
@@ -20,7 +28,7 @@ alpha = 1
 # Eigenbedarf (über alle T Perioden, z. B. MWh)
 own_demand_total = [10, 25,  8, 15]
 #Erzeugerprofile (Erste Dimension Prosumer, Zweite Dimension Zeitschritte)
-pv     = [[0,0,5,2,8], [0,0,0,0,0], [0,0,0,0,0], [0,0,0,0,0]]
+pv     = [[0,0,0,0,0], [0,0,0,0,0], [0,0,0,0,0], [0,0,0,0,0]]
 p_feed = [1.5, 12, 0.75, 7.5, 0.75]            # Einspeisetarif [€/MWh]
 r_curt = [1, 8, 0.5, 5, 0.5]              # Vergütung für Verzicht (feed-in + kleiner Bonus)
 K_export = [10]*T
@@ -34,7 +42,15 @@ def solve_individual(i):
     curtail  = pulp.LpVariable.dicts("curtail",  (range(T)), lowBound=0.0)
 
     # Zielfunktion
-    m += pulp.lpSum(p_B[t]*qB[t] for t in range(T))
+    expr = pulp.lpSum(p_B[t]*qB[t] for t in range(T))
+
+    # Export-Vergütung
+    if FEED_IN_PAYMENTS and EC == 1:
+            expr += pulp.lpSum((-p_feed[t]) * export[t] for t in range(T))
+    # Curtail-Vergütung
+    if CURTAIL_PAYMENTS and EC == 1:
+        expr += pulp.lpSum((-r_curt[t]) * curtail[t] for t in range(T))
+    m += expr
     
     m += pulp.lpSum((qB[t] + use_pv[t]) for t in range (T)) == own_demand_total[i]
 
@@ -49,7 +65,16 @@ def solve_individual(i):
     status = m.solve(pulp.PULP_CBC_CMD(msg=0))
 
     v_total = pulp.value(m.objective)
-    v_stage = [pulp.value(p_B[t]*qB[t]) for t in range(T)]
+    v_stage = []
+    for t in range(T):
+        val = p_B[t]*pulp.value(qB[t])
+
+        if FEED_IN_PAYMENTS and EC == 1:
+            val += -p_feed[t] * pulp.value(export[t])
+        if CURTAIL_PAYMENTS and EC == 1:
+            val += -r_curt[t] * pulp.value(curtail[t])
+
+        v_stage.append(val)
     allocations = {
         "qB": [round(pulp.value(qB[t]), 2) for t in range(T)],
         "use_pv": [round(pulp.value(use_pv[t]), 2) for t in range(T)],
@@ -74,20 +99,33 @@ def solve_aggregation(mode="utilitarian", accept_type=None):
     curtail  = pulp.LpVariable.dicts("curtail",  (range(P), range(T)), lowBound=0.0)
     qDA_total = pulp.LpVariable.dicts("qDA_total", range(T), lowBound=0.0)
     bDA = pulp.LpVariable.dicts("bDA", range(T), cat="Binary")
+    if INTERNAL_SHARING:
+        send = pulp.LpVariable.dicts("send", (range(P), range(T)), lowBound=0.0)
+        recv = pulp.LpVariable.dicts("recv", (range(P), range(T)), lowBound=0.0)
 
     # Kosten pro Prosumer (nur Einkauf)
     costs = {}
-    for i in range (P):
-        costs[i] = pulp.lpSum(
-        (p_DA[t]*qDA[i][t] + p_B[t]*qB[i][t]
-        - p_feed[t]*export[i][t]*EC
-        - r_curt[t]*curtail[i][t]*EC
-        ) for t in range(T)
-        )
+    for i in range(P):
+        # Externer Einkauf
+        expr = pulp.lpSum(p_DA[t]*qDA[i][t] + p_B[t]*qB[i][t] for t in range(T))
+
+        if FEED_IN_PAYMENTS and EC == 1:
+            expr += pulp.lpSum((-p_feed[t]) * export[i][t] for t in range(T))  # Erlös mindert Kosten
+
+        if CURTAIL_PAYMENTS and EC == 1:
+            expr += pulp.lpSum((-r_curt[t]) * curtail[i][t] for t in range(T))  # Vergütung mindert Kosten
+
+        if INTERNAL_SHARING:
+            expr += pulp.lpSum( PI[t] * (recv[i][t] - send[i][t]) for t in range(T) )
+
+        costs[i] = expr
+
     costs_stage = {
-        (i,t): p_DA[t]*qDA[i][t] + p_B[t]*qB[i][t]
-              - p_feed[t]*export[i][t]*EC
-              - r_curt[t]*curtail[i][t]*EC
+        (i,t):
+            (p_DA[t]*qDA[i][t] + p_B[t]*qB[i][t])
+            + ( (-p_feed[t]) * export[i][t] if (FEED_IN_PAYMENTS and EC==1) else 0 )
+            + ( (-r_curt[t]) * curtail[i][t] if (CURTAIL_PAYMENTS and EC==1) else 0 )
+            + ( PI[t]*(recv[i][t] - send[i][t]) if INTERNAL_SHARING else 0 )
         for i in range(P) for t in range(T)
     }
 
@@ -105,13 +143,35 @@ def solve_aggregation(mode="utilitarian", accept_type=None):
 
     # Per-Perioden-Bilanzen inkl. PV
     for i in range(P):
-        m += pulp.lpSum((qDA[i][t] + qB[i][t] + use_pv[i][t]) for t in range(T)) == own_demand_total[i]
+
+        if INTERNAL_SHARING:
+            m += pulp.lpSum(qDA[i][t] + qB[i][t] + use_pv[i][t] + recv[i][t] for t in range(T)) == own_demand_total[i]
+        else:
+            m += pulp.lpSum(qDA[i][t] + qB[i][t] + use_pv[i][t]               for t in range(T)) == own_demand_total[i]
+
         for t in range(T):
             
-            m += use_pv[i][t] + export[i][t]*EC + curtail[i][t]*EC == pv[i][t]
+            if INTERNAL_SHARING:
+                if EC == 0:
+                    m += use_pv[i][t] + send[i][t] == pv[i][t]
+                    m += export[i][t] == 0
+                    m += curtail[i][t] == 0
+                else:
+                    m += use_pv[i][t] + export[i][t] + curtail[i][t] + send[i][t] == pv[i][t]
+            else:
+                if EC == 0:
+                    m += use_pv[i][t] == pv[i][t]
+                    m += export[i][t] == 0
+                    m += curtail[i][t] == 0
+                else:
+                    m += use_pv[i][t] + export[i][t] + curtail[i][t] == pv[i][t]
             
             m += qDA[i][t] + qB[i][t] >= q_min[i]
             m += qDA[i][t] + qB[i][t] <= q_max[i]
+    
+    if INTERNAL_SHARING:
+        for t in range(T):
+            m += pulp.lpSum(send[i][t] for i in range(P)) == pulp.lpSum(recv[i][t] for i in range(P))
 
     # Zielfunktion
     if mode == "utilitarian":
@@ -178,8 +238,10 @@ def solve_aggregation(mode="utilitarian", accept_type=None):
         "qDA": [round(pulp.value(qDA[i][t]), 2) for t in range(T)],
         "qB": [round(pulp.value(qB[i][t]), 2) for t in range(T)],
         "use_pv": [round(pulp.value(use_pv[i][t]), 2) for t in range(T)],
-        "export": [round(pulp.value(export[i][t]), 2) for t in range(T)] if EC else 0.0,
-        "curtail": [round(pulp.value(curtail[i][t]), 2) for t in range(T)] if EC else 0.0,
+        "export": [round(pulp.value(export[i][t]), 2) for t in range(T)] if EC else None,
+        "curtail": [round(pulp.value(curtail[i][t]), 2) for t in range(T)] if EC else None,
+        "send":   [round(pulp.value(send[i][t]), 2) for t in range(T)] if INTERNAL_SHARING else None,
+        "recv":   [round(pulp.value(recv[i][t]), 2) for t in range(T)] if INTERNAL_SHARING else None,
     }
     for i in range(P)
     }
@@ -215,11 +277,11 @@ for mode, acc, label in cases:
 # Plot
 N = len(scenarios)
 x = np.arange(N)
-bar_width = 0.2
+bar_width = 0.25
 
-costs = np.array(costs_by_agent)  # shape (N, 4) -> je Szenario die 4 Prosumer-Kosten
+costs = np.array(costs_by_agent)
 colors = ["#4e79a7", "#f28e2c", "#e15759", "#76b7b2"]
-agent_labels = ["P1", "P2", "P3", "P4"]
+agent_labels = [f"P{i+1}" for i in range(costs.shape[1])]
 
 fig, ax = plt.subplots(figsize=(12, 7))
 
@@ -230,58 +292,63 @@ neg = np.where(costs < 0, costs, 0.0)
 pos_bottom = np.zeros(N)
 neg_bottom = np.zeros(N)
 
-# Gestapelte Balken zeichnen (Positiv nach oben, Negativ nach unten)
-for j in range(costs.shape[1]):  # je Prosumer
+for j in range(costs.shape[1]):
+    # Positive Balken
     ax.bar(x, pos[:, j], bar_width, bottom=pos_bottom, color=colors[j],
-           label=agent_labels[j] if j == 0 else None)  # Legende einmalig
-    ax.bar(x, neg[:, j], bar_width, bottom=neg_bottom, color=colors[j])
+           label=agent_labels[j] if j == 0 else None)
     pos_bottom += pos[:, j]
+
+    # Negative Balken
+    ax.bar(x, neg[:, j], bar_width, bottom=neg_bottom, color=colors[j])
     neg_bottom += neg[:, j]
 
-# Totals + sinnvolle y-Grenzen
+# Totals (Summen über alle Prosumer)
 totals = costs.sum(axis=1)
-y_top = pos_bottom.copy()         # Oberkante jedes Balkens
-y_bot = neg_bottom.copy()         # Unterkante jedes Balkens (≤ 0)
-ymax = float(np.max(y_top)) if N else 0.0
-ymin = float(np.min(y_bot)) if N else 0.0
+
+# Ober- und Unterkante der Balken
+top_edge = pos_bottom
+bot_edge = neg_bottom
+
+ymax = float(np.max(top_edge)) if N else 0.0
+ymin = float(np.min(bot_edge)) if N else 0.0
 yrange = max(1.0, ymax - ymin)
 offset = 0.02 * yrange
 
+# Summenbeschriftung außerhalb der Balken
 for i, tot in enumerate(totals):
-    y = tot + (offset if tot >= 0 else -offset)
-    va = "bottom" if tot >= 0 else "top"
+    if tot >= 0:
+        y = top_edge[i] + offset
+        va = "bottom"
+    else:
+        y = bot_edge[i] - offset
+        va = "top"
     ax.text(x[i], y, f"{tot:.1f}", ha="center", va=va, fontsize=9)
 
-# Prosumer-Kosten NEBEN dem Balken (inkl. negativer Werte)
-x_side_offset = 0.35  # in Daten-Koordinaten; gerne auf 0.45 erhöhen, wenn knapp
+# Prosumer-Kosten-Box rechts neben jedem Balken
+x_side_offset = 0.35
 for i in range(N):
-    # Vertikale Mitte zwischen Top und Bottom des Balkens
-    y_mid = 0.5 * (y_top[i] + y_bot[i])
-    lines = [f"P{p+1}: {costs[i, p]:.1f}" for p in range(costs.shape[1])]
+    lines = [f"{agent_labels[p]}: {costs[i, p]:.1f}" for p in range(costs.shape[1])]
     text = "\n".join(lines)
-    ax.text(
-        x[i] + x_side_offset, y_mid, text,
-        ha="left", va="center", fontsize=8,
-        bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="gray", alpha=0.85),
-        zorder=5
-    )
+    y_mid = 0.5 * (top_edge[i] + bot_edge[i])
+    ax.text(x[i] + x_side_offset, y_mid, text,
+            ha="left", va="center", fontsize=8,
+            bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="gray", alpha=0.85))
 
-# Null-Linie
+# Null-Linie für Orientierung
 ax.axhline(0, linewidth=1, color="black")
 
-# Achsen & Titel
+# Achsen und Titel
 ax.set_xticks(x)
 ax.set_xticklabels(scenarios, rotation=35, ha="right")
 ax.set_ylabel("Kosten (Geldeinheiten)")
-ax.set_title("Gesamtkosten je Modell")
+ax.set_title("Gesamtkosten je Modell (gestapelt) – mit Netto-Produzenten (negative Kosten)")
 
-# Legende (einmalig, Farben reichen als Kodierung)
+# Legende
 handles = [plt.Rectangle((0,0),1,1,color=colors[j]) for j in range(costs.shape[1])]
 ax.legend(handles, agent_labels, ncol=4, loc="upper left", bbox_to_anchor=(0,1.15))
 
-# Platz rechts für die Boxen lassen
-ax.set_xlim(-0.5, N - 0.5 + x_side_offset + 0.6)
-ax.set_ylim(ymin - 0.06*yrange, ymax + 0.10*yrange)
+ax.set_xlim(-0.5, N - 0.5 + x_side_offset + 0.8)
+ax.set_ylim(ymin - 0.08*yrange, ymax + 0.10*yrange)
 
 plt.tight_layout()
 plt.savefig("fairness_results_stacked_signed.png", dpi=300)
@@ -290,70 +357,107 @@ SOLVER = pulp.PULP_CBC_CMD(msg=0, timeLimit=300)
 
 def coalition_cost(S, accept_type=None, alpha=alpha):
     """
-    C(S) unter denselben Physik-Constraints wie Aggregation.
-    Wenn accept_type in {"Aav","Ap","As"}, dann auch diese Acceptability 
-    (nur bezogen auf die Spieler i ∈ S) hinzufügen.
+    C(S): Minimale Koalitionskosten der Spieler in S unter denselben Physik-
+    und Preis-Constraints wie im Aggregationsmodell.
+    accept_type in {None, "Aav", "Ap", "As"} wird analog angewandt (nur auf i ∈ S).
     """
-    m = pulp.LpProblem("", pulp.LpMinimize)
+    m = pulp.LpProblem("coalition_cost", pulp.LpMinimize)
 
-    qDA = pulp.LpVariable.dicts("qDA", (range(P), range(T)), lowBound=0)
-    qB  = pulp.LpVariable.dicts("qB",  (range(P), range(T)), lowBound=0)
-    use_pv = pulp.LpVariable.dicts("use_pv", (range(P), range(T)), lowBound=0)
-    export   = pulp.LpVariable.dicts("export",   (range(P), range(T)), lowBound=0)
-    curtail  = pulp.LpVariable.dicts("curtail",  (range(P), range(T)), lowBound=0)
-    qDA_total = pulp.LpVariable.dicts("qDA_total", range(T), lowBound=0)
-    export_total = pulp.LpVariable.dicts("export_total", range(T), lowBound=0)
+    # Variablen
+    qDA = pulp.LpVariable.dicts("qDA", (range(P), range(T)), lowBound=0.0)
+    qB  = pulp.LpVariable.dicts("qB",  (range(P), range(T)), lowBound=0.0)
+    use_pv  = pulp.LpVariable.dicts("use_pv",  (range(P), range(T)), lowBound=0.0)
+    export  = pulp.LpVariable.dicts("export",  (range(P), range(T)), lowBound=0.0)
+    curtail = pulp.LpVariable.dicts("curtail", (range(P), range(T)), lowBound=0.0)
+    qDA_total    = pulp.LpVariable.dicts("qDA_total", range(T), lowBound=0.0)
+    export_total = pulp.LpVariable.dicts("export_total", range(T), lowBound=0.0)
     bDA = pulp.LpVariable.dicts("bDA", range(T), cat="Binary")
 
-    # Kosten je i,t:
-    costs_stage = {
-        (i,t): p_DA[t]*qDA[i][t] + p_B[t]*qB[i][t]
-              - p_feed[t]*export[i][t] - r_curt[t]*curtail[i][t]
-        for i in S for t in range(T)
-    }
-    costs_i = { i: pulp.lpSum(costs_stage[(i,t)] for t in range(T)) for i in S }
-    m += pulp.lpSum(costs_i[i] for i in S)   # Zielfunktion: C(S)
+    if INTERNAL_SHARING:
+        send = pulp.LpVariable.dicts("send", (range(P), range(T)), lowBound=0.0)
+        recv = pulp.LpVariable.dicts("recv", (range(P), range(T)), lowBound=0.0)
 
-    # Physik-Constraints für Koalition S
+    costs_stage = {}
     for i in S:
         for t in range(T):
-            # Per-Periode Energiebilanz
-            m += qDA[i][t] + qB[i][t] + use_pv[i][t] == (own_demand_total[i]/T)
-            # PV-Split (EC schaltet Export/Curtail aus)
-            m += use_pv[i][t] + export[i][t]*EC + curtail[i][t]*EC <= pv[i][t]
-            # Einkaufsgrenzen
+            expr = p_DA[t]*qDA[i][t] + p_B[t]*qB[i][t]
+            if FEED_IN_PAYMENTS and EC == 1:
+                expr += (-p_feed[t]) * export[i][t]
+            if CURTAIL_PAYMENTS and EC == 1:
+                expr += (-r_curt[t]) * curtail[i][t]
+            if INTERNAL_SHARING:
+                expr += PI[t] * (recv[i][t] - send[i][t])
+            costs_stage[(i,t)] = expr
+
+    # Zielfunktion: Summe der Koalitionskosten
+    m += pulp.lpSum(costs_stage[(i,t)] for i in S for t in range(T))
+
+    # Physik-Constraints
+    for i in S:
+        # Pro t: PV-Accounting + Einkaufsgrenzen
+        for t in range(T):
+            if INTERNAL_SHARING:
+                if EC == 0:
+                    m += use_pv[i][t] + send[i][t] == pv[i][t]
+                    m += export[i][t] == 0
+                    m += curtail[i][t] == 0
+                else:
+                    m += use_pv[i][t] + export[i][t] + curtail[i][t] + send[i][t] == pv[i][t]
+            else:
+                if EC == 0:
+                    m += use_pv[i][t] == pv[i][t]
+                    m += export[i][t] == 0
+                    m += curtail[i][t] == 0
+                else:
+                    m += use_pv[i][t] + export[i][t] + curtail[i][t] == pv[i][t]
+
             m += qDA[i][t] + qB[i][t] >= q_min[i]
             m += qDA[i][t] + qB[i][t] <= q_max[i]
-    
-    for t in range(T):
-        m += pulp.lpSum(export[i][t] for i in S) == export_total[t]
-        m += export_total[t] <= K_export[t]
 
-    # Day-Ahead-Block
+        # Summenbilanz über den Horizont
+        if INTERNAL_SHARING:
+            m += pulp.lpSum(qDA[i][t] + qB[i][t] + use_pv[i][t] + recv[i][t] for t in range(T)) == own_demand_total[i]
+        else:
+            m += pulp.lpSum(qDA[i][t] + qB[i][t] + use_pv[i][t]               for t in range(T)) == own_demand_total[i]
+
+    # Day-Ahead-Block (Aggregation in S)
     for t in range(T):
         m += pulp.lpSum(qDA[i][t] for i in S) == qDA_total[t]
         m += qDA_total[t] >= q_DA_min_trade * bDA[t]
         for i in S:
             m += qDA[i][t] <= q_max[i] * bDA[t]
-        # Acceptability-Variante für Koalition S
-        if accept_type is not None:
-            v_solo_S = { i: v_stagewise[i] for i in S }
-        if accept_type == "As":
-            for i in S:
-                for t in range(T):
-                    m += costs_stage[(i,t)] <= alpha * v_solo_S[i][t]
-        elif accept_type == "Ap":
-            for i in S:
-                pref = 0.0
-                for t in range(T):
-                    pref += v_solo_S[i][t]
-                    m += pulp.lpSum(costs_stage[(i,tt)] for tt in range(t+1)) <= alpha * pref
-        elif accept_type == "Aav":
-            for i in S:
-                m += pulp.lpSum(costs_stage[(i,t)] for t in range(T)) <= alpha * sum(v_solo_S[i])
 
-    status = m.solve(SOLVER)
-    return float(sum(pulp.value(costs_i[i]) for i in S))
+    # Export-Kappe
+    if EC == 1:
+        for t in range(T):
+            m += pulp.lpSum(export[i][t] for i in S) == export_total[t]
+            m += export_total[t] <= K_export[t]
+
+    # interne Transfers budgetneutral (nur innerhalb S)
+    if INTERNAL_SHARING:
+        for t in range(T):
+            m += pulp.lpSum(send[i][t] for i in S) == pulp.lpSum(recv[i][t] for i in S)
+
+    # Acceptability (nur auf i ∈ S anwenden)
+    if accept_type == "As":
+        for i in S:
+            for t in range(T):
+                m += costs_stage[(i,t)] <= alpha * v_stagewise[i][t]
+    elif accept_type == "Ap":
+        for i in S:
+            pref = 0.0
+            for tt in range(T):
+                pref += v_stagewise[i][tt]
+                m += pulp.lpSum(costs_stage[(i,tt2)] for tt2 in range(tt+1)) <= alpha * pref
+    elif accept_type == "Aav":
+        for i in S:
+            m += pulp.lpSum(costs_stage[(i,t)] for t in range(T)) <= alpha * sum(v_stagewise[i])
+
+    # Solve
+    _ = m.solve(SOLVER)
+
+    # Rückgabe: C(S)
+    return float(sum(pulp.value(costs_stage[(i,t)]) for i in S for t in range(T)))
 
 def shapley_values(players, coalition_cost_fn, mode="costs", accept_type=None, alpha=alpha):
     """
@@ -376,7 +480,6 @@ def shapley_values(players, coalition_cost_fn, mode="costs", accept_type=None, a
         v_fun = lambda S: -C[S]
 
     # Shapley
-    import math
     phi = {i: 0.0 for i in P}
     for S in C.keys():
         Sset = set(S)
@@ -412,10 +515,10 @@ if __name__ == "__main__":
     print(f"[INFO] C(N) (utilitarian): {C_N:.2f}")
 
     # Kosten-Shapley je Variante
-    charges_None = shapley_values(range(P), coalition_cost, mode="costs", accept_type=None)
-    charges_Aav  = shapley_values(range(P), coalition_cost, mode="costs", accept_type="Aav", alpha=alpha)
-    charges_Ap   = shapley_values(range(P), coalition_cost, mode="costs", accept_type="Ap",  alpha=alpha)
-    charges_As   = shapley_values(range(P), coalition_cost, mode="costs", accept_type="As",  alpha=alpha)
+    charges_None, savings_None = shapley_values(range(P), coalition_cost, mode="savings", accept_type=None)
+    charges_Aav, savings_Aav  = shapley_values(range(P), coalition_cost, mode="savings", accept_type="Aav", alpha=alpha)
+    charges_Ap, savings_Ap   = shapley_values(range(P), coalition_cost, mode="savings", accept_type="Ap",  alpha=alpha)
+    charges_As, savings_As   = shapley_values(range(P), coalition_cost, mode="savings", accept_type="As",  alpha=alpha)
 
     # Matrix für den Stack
     variants = ["None","Aav","Ap","As"]
@@ -424,29 +527,39 @@ if __name__ == "__main__":
         [charges_Aav[i]  for i in range(P)],
         [charges_Ap[i]   for i in range(P)],
         [charges_As[i]   for i in range(P)],
-    ])  
+    ])
+    stacks_savings = np.array([
+        [savings_None[i] for i in range(P)],
+        [savings_Aav[i]  for i in range(P)],
+        [savings_Ap[i]   for i in range(P)],
+        [savings_As[i]   for i in range(P)],
+    ]) 
+    for s in stacks_savings:
+        values = [float(s[i]) for i in range(P)]
+        print("Shapley φ (Einsparungen):", [round(values[i], 1) for i in range(P)])
+        print("Zahlungen v_i - φ_i:", [round(v_individual[i] - values[i], 1) for i in range(P)])
+
 
     # Plot
-    x = np.arange(len(variants))
-    width = 0.65
-    colors = ["#4e79a7", "#f28e2c", "#e15759", "#76b7b2"]
-    agent_labels = ["P1","P2","P3","P4"]
-
-    fig, ax = plt.subplots(figsize=(10, 6))
-    bottom = np.zeros(len(variants))
-    for j in range(P):
-        ax.bar(x, stacks[:, j], width, bottom=bottom, label=agent_labels[j], color=colors[j])
-        bottom += stacks[:, j]
-
-    totals = stacks.sum(axis=1)
-    for i, tot in enumerate(totals):
-        ax.text(x[i], tot + max(totals)*0.01, f"{tot:.0f}", ha="center", va="bottom", fontsize=9)
-
-    ax.set_xticks(x)
-    ax.set_xticklabels(variants)
-    ax.set_ylabel("Kosten-Zahlung (Shapley)")
-    ax.set_title("Kosten-Shapley je Acceptability-Variante")
-    ax.legend(ncol=4, loc="upper left", bbox_to_anchor=(0,1.15))
-    plt.tight_layout()
-    plt.savefig("fairness_shapley_costs_by_variant.png", dpi=300)
-    print("Plot gespeichert als fairness_shapley_costs_by_variant.png")
+    #x = np.arange(len(variants))
+    #width = 0.65
+    #colors = ["#4e79a7", "#f28e2c", "#e15759", "#76b7b2"]
+    #agent_labels = ["P1","P2","P3","P4"]
+#
+    #fig, ax = plt.subplots(figsize=(10, 6))
+    #bottom = np.zeros(len(variants))
+    #for j in range(P):
+    #    ax.bar(x, stacks[:, j], width, bottom=bottom, label=agent_labels[j], color=colors[j])
+    #    bottom += stacks[:, j]
+#
+    #totals = stacks.sum(axis=1)
+    #for i, tot in enumerate(totals):
+    #    ax.text(x[i], tot + max(totals)*0.01, f"{tot:.0f}", ha="center", va="bottom", fontsize=9)
+#
+    #ax.set_xticks(x)
+    #ax.set_xticklabels(variants)
+    #ax.set_ylabel("Kosten-Zahlung (Shapley)")
+    #ax.set_title("Kosten-Shapley je Acceptability-Variante")
+    #ax.legend(ncol=4, loc="upper left", bbox_to_anchor=(0,1.15))
+    #plt.tight_layout()
+    #plt.savefig("fairness_shapley_costs_by_variant.png", dpi=300)
